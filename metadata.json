@@ -1,0 +1,6 @@
+{
+  "name": "Sistema Troca Turno - Torre de Controle",
+  "description": "Sistema para gerenciamento e registro de troca de turno na Torre de Controle.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

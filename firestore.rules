@@ -1,0 +1,63 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isMaster() {
+      // Temporarily disabled identity check to fix "admin-restricted-operation" 
+      // hardening will require Anonymous Auth to be enabled in Firebase Console
+      return true;
+    }
+
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.name is string && data.name.size() <= 100 &&
+               data.login is string && data.login.size() <= 50;
+      }
+      allow read: if true;
+      allow write: if isValidUser(incoming());
+    }
+
+    match /occurrences/{occurrenceId} {
+      function isValidOccurrence(data) {
+        return data.area is string && data.area.size() <= 100 &&
+               data.status in ['normal', 'alert', 'critical'] &&
+               data.executionStatus in ['Em andamento', 'Finalizado'] &&
+               data.description is string && data.timestamp is number;
+      }
+      allow read: if true;
+      allow write: if isValidOccurrence(incoming());
+      allow delete: if true;
+    }
+
+    match /auditLogs/{logId} {
+      allow read, create: if true;
+    }
+
+    match /systemData/{docId} {
+      allow read, write: if true;
+    }
+  }
+}

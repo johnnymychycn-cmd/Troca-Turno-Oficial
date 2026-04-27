@@ -1,0 +1,79 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "System user profile",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "login": { "type": "string" },
+        "password": { "type": "string" },
+        "role": { "type": "string", "enum": ["Gerente", "Encarregado", "Supervisor", "Analista Logístico", "ADM"] },
+        "area": { "type": "string" },
+        "permissionLevel": { "type": "string", "enum": ["Intermediário", "Master", "Básico"] }
+      },
+      "required": ["id", "name", "login", "password", "role", "area", "permissionLevel"]
+    },
+    "Occurrence": {
+      "title": "Occurrence",
+      "description": "Shipment/Shift record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "date": { "type": "string" },
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "area": { "type": "string" },
+        "regional": { "type": "string" },
+        "tsId": { "type": "string" },
+        "unidade": { "type": "string" },
+        "shift": { "type": "string" },
+        "status": { "type": "string", "enum": ["normal", "alert", "critical"] },
+        "executionStatus": { "type": "string", "enum": ["Em andamento", "Finalizado"] },
+        "description": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "comments": {
+          "type": "array",
+          "items": { "type": "object" }
+        }
+      },
+      "required": ["id", "userId", "area", "regional", "tsId", "status", "executionStatus", "description", "timestamp"]
+    },
+    "AuditLog": {
+      "title": "Audit Log",
+      "description": "History of user changes",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "targetUserId": { "type": "string" },
+        "targetUserName": { "type": "string" },
+        "type": { "type": "string" },
+        "oldValue": { "type": "string" },
+        "newValue": { "type": "string" },
+        "changedById": { "type": "string" },
+        "changedByName": { "type": "string" },
+        "timestamp": { "type": "number" }
+      },
+      "required": ["id", "targetUserId", "type", "changedById", "timestamp"]
+    }
+  },
+  "firestore": {
+    "users": {
+      "schema": "User",
+      "description": "Collection of system users"
+    },
+    "occurrences": {
+      "schema": "Occurrence",
+      "description": "Collection of shift records/occurrences"
+    },
+    "auditLogs": {
+      "schema": "AuditLog",
+      "description": "Collection of system audit logs"
+    },
+    "systemData": {
+      "schema": "object",
+      "description": "General system configuration and KPIs"
+    }
+  }
+}
