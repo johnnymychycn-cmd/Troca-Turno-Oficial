@@ -121,3 +121,50 @@
     @apply font-sans;
     }
 }
+
+/* Custom Quill Styles */
+.quill-wrapper .ql-container {
+  border: none !important;
+  font-family: inherit !important;
+}
+.quill-wrapper .ql-toolbar {
+  border: none !important;
+  border-bottom: 1px solid #e2e8f0 !important;
+  background: white !important;
+  border-top-left-radius: 0.75rem;
+  border-top-right-radius: 0.75rem;
+}
+.quill-wrapper .ql-editor {
+  min-height: 100px;
+  font-size: 11px;
+}
+.quill-wrapper .ql-editor.ql-blank::before {
+  color: #94a3b8 !important;
+  font-style: normal !important;
+  font-weight: 700 !important;
+  opacity: 0.5;
+}
+
+/* Formatted content resets for lists */
+.formatted-content {
+  white-space: pre-wrap !important;
+}
+.formatted-content ul {
+  list-style-type: disc !important;
+  padding-left: 1.5rem !important;
+  margin: 0.5rem 0 !important;
+}
+.formatted-content ol {
+  list-style-type: decimal !important;
+  padding-left: 1.5rem !important;
+  margin: 0.5rem 0 !important;
+}
+.formatted-content p {
+  margin-bottom: 0.25rem !important;
+}
+.formatted-content p:last-child {
+  margin-bottom: 0 !important;
+}
+.formatted-content strong {
+  font-weight: 900 !important;
+}

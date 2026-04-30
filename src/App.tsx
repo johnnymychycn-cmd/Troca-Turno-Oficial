@@ -1,4 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import ReactQuill from 'react-quill';
+import 'react-quill/dist/quill.snow.css';
+import DOMPurify from 'dompurify';
 import { 
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, 
   LineChart, Line, AreaChart, Area as RechartsArea
@@ -134,7 +137,6 @@ const SUB_AREAS = [
   'MS',
   'MA',
   'BA',
-  'LEM',
   'Depósito Externo',
   'Comercializadora Rodobras'
 ];
@@ -258,13 +260,20 @@ const LoginForm = ({ onLogin, usersList }: { onLogin: (u: UserData) => void, use
 };
 
 
+const REGIONAL_UNITS_MAP: Record<string, string[]> = {
+  'MT': ['Nova Mutum - MT', 'Sinop - MT'],
+  'MS': ['Dourados - MS', 'Sidrolândia - MS'],
+  'MA': ['Balsas - MA'],
+  'BA': ['Luís Eduardo Magalhães - BA']
+};
+
 const UNIDADES_REGISTRO = [
-  'Sinop - MT',
   'Nova Mutum - MT',
+  'Sinop - MT',
   'Dourados - MS',
   'Sidrolândia - MS',
   'Balsas - MA',
-  'Eduardo Magalhães - BA'
+  'Luís Eduardo Magalhães - BA'
 ];
 
 interface AuditLog {
@@ -293,6 +302,19 @@ async function createAuditLog(log: Omit<AuditLog, 'id' | 'timestamp'>) {
   }
 }
 
+// --- Quill Configuration ---
+const QUILL_MODULES = {
+  toolbar: [
+    ['bold', 'italic', 'underline'],
+    [{ 'list': 'ordered'}, { 'list': 'bullet' }],
+    ['clean']
+  ],
+};
+
+const QUILL_FORMATS = [
+  'bold', 'italic', 'underline', 'list', 'bullet'
+];
+
 export default function App() {
   const [usersList, setUsersList] = useState<UserData[]>([]);
   const [user, setUser] = useState<UserData | null>(null);
@@ -312,13 +334,36 @@ export default function App() {
   // --- Form State ---
   const [selectedFormUnit, setSelectedFormUnit] = useState('');
 
+  const filteredUnits = useMemo(() => {
+    if (selectedRegionals.length === 0) return [];
+    
+    const units: string[] = [];
+    selectedRegionals.forEach(reg => {
+      const regUnits = REGIONAL_UNITS_MAP[reg] || [];
+      regUnits.forEach(u => {
+        if (!units.includes(u)) units.push(u);
+      });
+    });
+    return units.sort();
+  }, [selectedRegionals]);
+
+  useEffect(() => {
+    if (selectedFormUnit && !filteredUnits.includes(selectedFormUnit)) {
+      setSelectedFormUnit('');
+    }
+  }, [filteredUnits, selectedFormUnit]);
+
+  const isUnitHidden = selectedArea === 'Etanol' && 
+    selectedRegionals.length > 0 &&
+    selectedRegionals.every(reg => ['Comercializadora Rodobras', 'Depósito Externo'].includes(reg));
+
   // --- History Filter State ---
   const [historyFilterType, setHistoryFilterType] = useState<'7days' | '30days' | 'custom'>('7days');
   const [customDateRange, setCustomDateRange] = useState({ 
     start: format(subDays(new Date(), 7), 'yyyy-MM-dd'), 
     end: format(new Date(), 'yyyy-MM-dd') 
   });
-  const [appliedFilter, setAppliedFilter] = useState<'7days' | '30days' | 'custom'>('7days');
+  const [appliedFilter, setAppliedFilter] = useState<'today' | '7days' | '30days' | 'custom'>('7days');
 
   const [areaKpis, setAreaKpis] = useState<Record<string, Record<string, number>>>({
     'Óleo': { 'Em Rota': 12, 'Toco': 8, 'Manutenção': 3, 'Sem Sinal': 2 },
@@ -348,7 +393,7 @@ export default function App() {
           });
         }
       }, (error) => {
-        console.warn('Sync users error:', error);
+        handleFirestoreError(error, OperationType.GET, 'users');
       });
 
       // Listen to occurrences
@@ -357,7 +402,7 @@ export default function App() {
         const recordsData = snapshot.docs.map(doc => doc.data() as ShiftRecord);
         setRecords(recordsData);
       }, (error) => {
-        console.warn('Sync occurrences error:', error);
+        handleFirestoreError(error, OperationType.GET, 'occurrences');
       });
 
       // Listen to KPIs
@@ -365,7 +410,7 @@ export default function App() {
         if (snap.exists()) {
           setAreaKpis(snap.data() as Record<string, Record<string, number>>);
         }
-      }, (err) => console.warn('KPI Sync error:', err));
+      }, (err) => handleFirestoreError(err, OperationType.GET, 'systemData/kpis'));
     };
 
     // Start sync immediately regardless of Firebase Auth state
@@ -410,6 +455,111 @@ export default function App() {
       setDoc(doc(db, 'systemData', 'kpis'), areaKpis);
     }
   }, [areaKpis]);
+
+  // --- Data Consistency & Remanagement Migration ---
+  useEffect(() => {
+    // 1. Cleanup selectedRegionals if it contains obsolete 'LEM'
+    if (selectedRegionals.includes('LEM')) {
+      setSelectedRegionals(prev => prev.filter(r => r !== 'LEM'));
+    }
+
+    // 2. Data Consistency Remanagement (Master users only)
+    if (!user || user.permissionLevel !== 'Master' || records.length === 0) return;
+    
+    const recordsToCorrect = records.filter(r => {
+      // Skip if it doesn't have a unit (e.g. some Etanol regionals)
+      if (!r.unidade) {
+        // Special case: old LEM records must be migrated even if they had no unit (unlikely but safe)
+        return r.regional === 'LEM';
+      }
+
+      // Check legacy LEM regional
+      if (r.regional === 'LEM') return true;
+
+      // Check legacy unit name
+      if (r.unidade.includes('Eduardo Magalhães') && !r.unidade.startsWith('Luís')) return true;
+
+      // Find correct regional for the unit
+      let correctRegional: string | null = null;
+      for (const [reg, units] of Object.entries(REGIONAL_UNITS_MAP)) {
+        if (units.includes(r.unidade!)) {
+          correctRegional = reg;
+          break;
+        }
+      }
+
+      // If mapped to a specific regional but current is different
+      if (correctRegional && r.regional !== correctRegional) return true;
+
+      // Check state code suffixes as secondary validation
+      const upperUnid = r.unidade.toUpperCase();
+      if (upperUnid.endsWith(' - BA') && r.regional !== 'BA') return true;
+      if (upperUnid.endsWith(' - MA') && r.regional !== 'MA') return true;
+      if (upperUnid.endsWith(' - MT') && r.regional !== 'MT') return true;
+      if (upperUnid.endsWith(' - MS') && r.regional !== 'MS') return true;
+
+      return false;
+    });
+
+    if (recordsToCorrect.length > 0) {
+      recordsToCorrect.forEach(async (r) => {
+        try {
+          let targetRegional = r.regional;
+          let targetUnidade = r.unidade || '';
+
+          // Fix unit name if it's the old version
+          if (targetUnidade.includes('Eduardo Magalhães') && !targetUnidade.startsWith('Luís')) {
+            targetUnidade = 'Luís Eduardo Magalhães - BA';
+          }
+
+          // Determine correct regional
+          if (r.regional === 'LEM') {
+            targetRegional = 'BA';
+            if (!targetUnidade) targetUnidade = 'Luís Eduardo Magalhães - BA';
+          } else if (targetUnidade) {
+            // Priority 1: Map check
+            let foundReg = false;
+            for (const [reg, units] of Object.entries(REGIONAL_UNITS_MAP)) {
+              if (units.includes(targetUnidade)) {
+                targetRegional = reg;
+                foundReg = true;
+                break;
+              }
+            }
+            // Priority 2: Suffix check if not found in map
+            if (!foundReg) {
+              const upperUnid = targetUnidade.toUpperCase();
+              if (upperUnid.endsWith(' - BA')) targetRegional = 'BA';
+              else if (upperUnid.endsWith(' - MA')) targetRegional = 'MA';
+              else if (upperUnid.endsWith(' - MT')) targetRegional = 'MT';
+              else if (upperUnid.endsWith(' - MS')) targetRegional = 'MS';
+            }
+          }
+
+          // Avoid infinite loops if nothing changed
+          if (r.regional === targetRegional && r.unidade === targetUnidade) return;
+
+          await updateDoc(doc(db, 'occurrences', r.id), {
+            regional: targetRegional,
+            unidade: targetUnidade,
+            updatedAt: Date.now()
+          });
+          
+          await createAuditLog({
+            type: 'REMANEJAMENTO_CONSISTENCIA',
+            targetUserId: r.id,
+            targetUserName: `${r.tsId} - ${r.unidade || 'N/A'}`,
+            oldValue: `Reg: ${r.regional} | Unid: ${r.unidade || 'N/A'}`,
+            newValue: `Reg: ${targetRegional} | Unid: ${targetUnidade} (Ajuste Automático)`,
+            changedById: 'SYSTEM',
+            changedByName: 'Migration Service'
+          });
+        } catch (err) {
+          console.error(`Migration failed for record ${r.id}:`, err);
+        }
+      });
+    }
+  }, [records, user, selectedRegionals]);
 
   useEffect(() => {
     if (user) {
@@ -533,15 +683,25 @@ export default function App() {
 
   const currentRegionals = useMemo(() => {
     if (!selectedArea) return [];
-    const base = ['MT', 'MS', 'MA', 'BA', 'LEM', 'Depósito Externo'];
+    const base = ['MT', 'MS', 'MA', 'BA', 'Depósito Externo'];
     let result = [...base];
     if (selectedArea === 'Biomassa' || selectedArea === 'Linha Amarela') {
-      result = result.filter(r => r !== 'Depósito Externo' && r !== 'LEM');
+      result = result.filter(r => r !== 'Depósito Externo');
     }
-    if (selectedArea === 'Etanol') {
+    if (selectedArea === 'Etanol' || selectedArea === 'Todas') {
       result.push('Comercializadora Rodobras');
     }
     return result;
+  }, [selectedArea]);
+
+  useEffect(() => {
+    setShiftInputs({
+      'T1': { status: 'normal', description: '' },
+      'T2': { status: 'normal', description: '' },
+      'T3': { status: 'normal', description: '' },
+      'T4': { status: 'normal', description: '' },
+    });
+    setSelectedFormUnit('');
   }, [selectedArea]);
 
   useEffect(() => {
@@ -590,23 +750,33 @@ export default function App() {
 
   const handleSaveShiftRecord = async (shiftId: string) => {
     const input = shiftInputs[shiftId];
-    if (!selectedFormUnit) {
-      showToast('Por favor, selecione uma unidade.', 'error');
-      return;
-    }
-    if (!input.description.trim()) {
+    if (!selectedFormUnit && !isUnitHidden) {
+       showToast('Por favor, selecione uma unidade.', 'error');
+       return;
+     }
+    if (!input.description.replace(/<[^>]*>/g, '').trim()) {
       showToast('Por favor, descreva o relato operacional.', 'error');
       return;
     }
 
     const id = `LOG-${Date.now().toString(36).toUpperCase()}`;
+    
+    // Determine the regional based on the selected unit
+    let unitRegional = selectedRegionals[0];
+    for (const [reg, units] of Object.entries(REGIONAL_UNITS_MAP)) {
+      if (units.includes(selectedFormUnit)) {
+        unitRegional = reg;
+        break;
+      }
+    }
+
     const newRecord: ShiftRecord = {
       id,
       date: format(new Date(), 'yyyy-MM-dd'),
       userId: user!.id,
       userName: user!.name,
       area: selectedArea!,
-      regional: selectedRegional || selectedRegionals[0],
+      regional: unitRegional,
       tsId: shiftId,
       unidade: selectedFormUnit,
       shift: LOGISTICS_SHIFTS.find(s => s.id === shiftId)?.name || 'N/A',
@@ -623,11 +793,8 @@ export default function App() {
       setAppliedFilter('7days');
       setHistoryFilterType('7days');
       
-      const unitRegional = SUB_AREAS.find(reg => newRecord.unidade?.toUpperCase().includes(reg.toUpperCase())) || 
-                          (newRecord.unidade?.includes('Eduardo Magalhães') ? 'LEM' : null);
-      
-      if (unitRegional && !selectedRegionals.includes(unitRegional as string)) {
-        setSelectedRegionals([unitRegional as string]);
+      if (unitRegional && !selectedRegionals.includes(unitRegional)) {
+        setSelectedRegionals([unitRegional]);
       }
 
       setShiftInputs(prev => ({
@@ -705,9 +872,9 @@ export default function App() {
   };
 
   const handleSaveEdit = async (recordId: string) => {
-    if (!tempEditDescription.trim()) return;
+    if (!tempEditDescription.replace(/<[^>]*>/g, '').trim()) return;
     try {
-      await updateDoc(doc(db, 'occurrences', recordId), { description: tempEditDescription.trim() });
+      await updateDoc(doc(db, 'occurrences', recordId), { description: tempEditDescription });
       setEditingRecordId(null);
       showToast('Ocorrência atualizada!');
     } catch (err) {
@@ -724,7 +891,7 @@ export default function App() {
   };
 
   const filteredRecords = useMemo(() => {
-    if (!user) return [];
+    if (!user || !selectedArea || selectedRegionals.length === 0 || !selectedShiftId) return [];
     
     let baseRecords = [...records].sort((a, b) => b.timestamp - a.timestamp);
     
@@ -734,7 +901,10 @@ export default function App() {
     let endDate = new Date();
     endDate.setHours(23, 59, 59, 999);
 
-    if (appliedFilter === '7days') {
+    if (appliedFilter === 'today' as any) {
+      startDate = new Date();
+      startDate.setHours(0, 0, 0, 0);
+    } else if (appliedFilter === '7days') {
       startDate = subDays(now, 7);
       startDate.setHours(0, 0, 0, 0);
     } else if (appliedFilter === '30days') {
@@ -750,20 +920,14 @@ export default function App() {
     return baseRecords.filter(r => {
       const recordDate = new Date(r.timestamp);
       
-      // Filter by Operation (area) if selected
-      const matchesArea = !selectedArea || r.area === selectedArea;
+      // Strict Combined Filter: Must match EXACTLY the context
+      // At this point, we know all filters are present thanks to the check at top of useMemo
       
-      // Filter by Regional
-      const matchesRegional = selectedRegionals.length === 0 || selectedRegionals.includes(r.regional) || (
-        r.unidade && selectedRegionals.some(reg => (
-          r.unidade!.toUpperCase().includes(reg.toUpperCase()) ||
-          (reg === 'LEM' && r.unidade!.includes('Eduardo Magalhães')) ||
-          (reg === 'BA' && r.unidade!.includes('Eduardo Magalhães'))
-        ))
-      );
+      const matchesArea = selectedArea === 'Todas' || r.area === selectedArea;
+      
+      const matchesRegional = selectedRegionals.includes(r.regional);
 
-      // Filter by TS (Terminal/Sistema)
-      const matchesTS = !selectedShiftId || r.tsId === selectedShiftId;
+      const matchesTS = r.tsId === selectedShiftId;
       
       const matchesDate = recordDate >= startDate && recordDate <= endDate;
       
@@ -1094,7 +1258,7 @@ export default function App() {
               </motion.div>
             )}
 
-            {selectedArea && selectedRegional && selectedShiftId && (
+            {selectedArea && selectedRegionals.length > 0 && selectedShiftId && (
               <div className="space-y-6">
                 <div className="flex items-center justify-between bg-white p-4 rounded-2xl shadow-sm border border-slate-100">
                    <div className="flex items-center gap-4">
@@ -1166,6 +1330,7 @@ export default function App() {
                         <div className="p-6 space-y-5">
                            <h3 className="text-sm font-black uppercase tracking-[.2em] text-[#2B4C7E] text-center">REGISTRO DE OCORRÊNCIA</h3>
                            <div className="space-y-4">
+                            {!isUnitHidden && (
                               <div className="space-y-1.5">
                                 <label className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Unidade</label>
                                 <select 
@@ -1174,11 +1339,12 @@ export default function App() {
                                   className="w-full text-[11px] font-bold bg-[#F1F4F9] border-none rounded-xl px-4 py-3 focus:ring-2 ring-[#2B4C7E]"
                                 >
                                   <option value="">Selecione a Unidade</option>
-                                  {UNIDADES_REGISTRO.map(u => (
+                                  {filteredUnits.map(u => (
                                     <option key={u} value={u}>{u}</option>
                                   ))}
                                 </select>
                               </div>
+                            )}
 
                               <div className="space-y-1.5">
                                 <label className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Status (Criticidade)</label>
@@ -1206,15 +1372,22 @@ export default function App() {
 
                               <div className="space-y-1.5">
                                 <label className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Relato Operacional</label>
-                                <textarea 
-                                  placeholder="Descreva a ocorrência..."
-                                  value={shiftInputs[selectedShiftId].description}
-                                  onChange={(e) => setShiftInputs({
-                                    ...shiftInputs,
-                                    [selectedShiftId]: { ...shiftInputs[selectedShiftId], description: e.target.value }
-                                  })}
-                                  className="w-full h-32 text-[11px] font-medium bg-[#F1F4F9] border-none rounded-xl p-4 focus:ring-2 ring-[#2B4C7E] resize-none"
-                                />
+                                <div className="quill-wrapper bg-[#F1F4F9] rounded-xl overflow-hidden">
+                                  {shiftInputs[selectedShiftId] && (
+                                    <ReactQuill 
+                                      theme="snow"
+                                      placeholder="Descreva a ocorrência..."
+                                      value={shiftInputs[selectedShiftId].description}
+                                      onChange={(content) => setShiftInputs({
+                                        ...shiftInputs,
+                                        [selectedShiftId]: { ...shiftInputs[selectedShiftId], description: content }
+                                      })}
+                                      modules={QUILL_MODULES}
+                                      formats={QUILL_FORMATS}
+                                      className="border-none text-[11px]"
+                                    />
+                                  )}
+                                </div>
                               </div>
 
                               <div className="flex gap-3 pt-2">
@@ -1245,14 +1418,14 @@ export default function App() {
               </div>
             )}
 
-            {/* SEÇÃO DE HISTÓRICO - EXIBIDA APENAS QUANDO UM TS ESTÁ SELECIONADO */}
-            {selectedShiftId && (
+            {/* SEÇÃO DE HISTÓRICO - EXIBIDA APENAS COM SELEÇÃO SIMULTÂNEA DE OPERAÇÃO, REGIONAL E TS */}
+            {selectedArea && selectedRegionals.length > 0 && selectedShiftId && (
               <div id="history-list-container" className="pt-10 space-y-8">
                 <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 px-2">
                   <div className="flex items-center gap-3">
                     <div className="w-1.5 h-8 bg-[#2B4C7E] rounded-full mr-1" />
                     <h3 className="text-xl font-bold text-[#2B4C7E]">
-                      Histórico de Registros - {selectedArea} | {selectedRegionals.length > 1 ? `Múltiplas (${selectedRegionals.length})` : selectedRegional} | {selectedShiftId}
+                      Histórico Exclusivo - {selectedArea} | {selectedRegional || `Múltiplas (${selectedRegionals.length})`} | {selectedShiftId}
                     </h3>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1401,10 +1574,12 @@ export default function App() {
                                   <span className="bg-[#D9A65D] text-white px-3 py-1 rounded-md text-[10px] font-bold uppercase shadow-sm">
                                     {r.tsId}
                                   </span>
-                                  <div className="flex items-center gap-1.5 bg-emerald-500 text-white px-3 py-1 rounded-md text-[10px] font-bold uppercase shadow-sm">
-                                    <Building2 className="w-3 h-3" />
-                                    {r.unidade}
-                                  </div>
+                                  {r.unidade && (
+                                    <div className="flex items-center gap-1.5 bg-emerald-500 text-white px-3 py-1 rounded-md text-[10px] font-bold uppercase shadow-sm">
+                                      <Building2 className="w-3 h-3" />
+                                      {r.unidade}
+                                    </div>
+                                  )}
                                   <span className="bg-[#D1E1F8] text-[#2B4C7E] px-3 py-1 rounded-md text-[10px] font-bold uppercase">
                                     {r.userName}
                                   </span>
@@ -1423,18 +1598,26 @@ export default function App() {
                               <div className="py-2">
                                 {editingRecordId === r.id ? (
                                   <div className="space-y-3">
-                                    <textarea 
-                                      value={tempEditDescription} 
-                                      onChange={(e) => setTempEditDescription(e.target.value)} 
-                                      className="w-full text-sm font-medium text-slate-600 bg-slate-50 p-4 rounded-lg border-2 border-[#2B4C7E]/20 outline-none min-h-[100px] focus:border-[#2B4C7E]" 
-                                    />
+                                    <div className="quill-wrapper bg-slate-50 rounded-lg border-2 border-[#2B4C7E]/20 overflow-hidden">
+                                      <ReactQuill 
+                                        theme="snow"
+                                        value={tempEditDescription} 
+                                        onChange={(content) => setTempEditDescription(content)} 
+                                        modules={QUILL_MODULES}
+                                        formats={QUILL_FORMATS}
+                                        className="text-sm text-slate-600 border-none" 
+                                      />
+                                    </div>
                                     <div className="flex gap-2 justify-end">
                                       <button onClick={() => setEditingRecordId(null)} className="px-4 py-2 text-[11px] font-bold uppercase text-slate-400">Cancelar</button>
                                       <Button onClick={() => handleSaveEdit(r.id)} className="bg-[#2B4C7E] text-white px-6 py-2 rounded-lg text-[11px] font-bold uppercase">Salvar Edição</Button>
                                     </div>
                                   </div>
                                 ) : (
-                                  <p className="text-sm font-bold text-[#2B4C7E] uppercase leading-relaxed tracking-tight">{r.description}</p>
+                                  <div 
+                                    className="text-sm text-[#2B4C7E] leading-relaxed tracking-tight formatted-content ql-editor !p-0"
+                                    dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(r.description) }}
+                                  />
                                 )}
                               </div>
 
