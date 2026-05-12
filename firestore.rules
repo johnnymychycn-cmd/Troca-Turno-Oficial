@@ -41,15 +41,7 @@ service cloud.firestore {
     }
 
     match /occurrences/{occurrenceId} {
-      function isValidOccurrence(data) {
-        return data.area is string && data.area.size() <= 100 &&
-               data.status in ['normal', 'alert', 'critical'] &&
-               data.executionStatus in ['Em andamento', 'Finalizado'] &&
-               data.description is string && data.timestamp is number;
-      }
-      allow read: if true;
-      allow write: if isValidOccurrence(incoming());
-      allow delete: if true;
+      allow read, write, delete: if true;
     }
 
     match /auditLogs/{logId} {
@@ -58,6 +50,35 @@ service cloud.firestore {
 
     match /systemData/{docId} {
       allow read, write: if true;
+    }
+
+    match /operationalKpis/{kpiId} {
+      function isValidKpi(data) {
+        return data.area is string &&
+               data.regional is string &&
+               data.tsId is string &&
+               data.values is map &&
+               data.updatedAt is number;
+      }
+      allow read: if true;
+      allow write: if isValidKpi(incoming());
+    }
+
+    match /notifications/{notifId} {
+      function isValidNotif(data) {
+        return data.recipientId is string &&
+               data.senderId is string &&
+               data.recordId is string &&
+               data.isRead is bool &&
+               data.timestamp is number &&
+               data.recipientLogin is string &&
+               data.senderName is string &&
+               data.commentId is string &&
+               data.text is string;
+      }
+      allow read: if true;
+      allow write: if isValidNotif(incoming());
+      allow delete: if true;
     }
   }
 }

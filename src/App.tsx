@@ -11,7 +11,7 @@ import {
   Plus, Search, Filter, Save, Trash2, Edit2, AlertCircle, 
   CheckCircle2, Clock, MapPin, Building2, User, Key, Lock, Shield, Eye, EyeOff,
   Sun, Moon, ChevronRight, ChevronDown, Menu, X, Bell, Truck, Wrench, WifiOff, TrendingUp, Calendar,
-  MessageSquare, Send
+  MessageSquare, Send, RefreshCw, Check
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { format, subDays } from 'date-fns';
@@ -25,7 +25,9 @@ import {
   query, 
   orderBy, 
   setDoc,
-  getDoc
+  getDoc,
+  getDocs,
+  where
 } from 'firebase/firestore';
 import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { db, auth, OperationType, handleFirestoreError, testConnection } from './lib/firebase';
@@ -94,6 +96,19 @@ interface RecordComment {
   timestamp: number;
 }
 
+interface AppNotification {
+  id: string;
+  recipientId: string;
+  recipientLogin: string;
+  senderId: string;
+  senderName: string;
+  commentId: string;
+  recordId: string;
+  text: string;
+  isRead: boolean;
+  timestamp: number;
+}
+
 interface ShiftRecord {
   id: string;
   date: string;
@@ -159,11 +174,11 @@ const SHIFTS = [
 ];
 
 const MOCK_USERS: UserData[] = [
-  { id: '1', name: 'Carlos Forcina', login: 'Carlos.Forcina', password: '123456', role: 'Gerente', area: 'Todas', permissionLevel: 'Master' },
-  { id: '2', name: 'Julio Santos', login: 'Julio.Santos', password: '123456', role: 'Encarregado', area: 'Todas', permissionLevel: 'Master' },
-  { id: '3', name: 'Jonathan Pereira', login: 'Jonathan.Pereira', password: '123456', role: 'ADM', area: 'Todas', permissionLevel: 'Master' },
-  { id: '4', name: 'Ademilson Almeida', login: 'Ademilson.Almeida', password: '123456', role: 'Analista Logístico', area: 'DDGS/Etanol', permissionLevel: 'Intermediário' },
-  { id: '5', name: 'Fabielle Moreira', login: 'Fabielle.Moreira', password: '123456', role: 'Analista Logístico', area: 'DDGS', permissionLevel: 'Intermediário' },
+  { id: '1', name: 'Jonathan Felix', login: 'Jonathan.Felix', password: '123', role: 'ADM', area: 'Todas', permissionLevel: 'Master' },
+  { id: '2', name: 'Gabriel Amaral', login: 'Gabriel.Amaral', password: '123', role: 'ADM', area: 'Todas', permissionLevel: 'Master' },
+  { id: '3', name: 'Carlos Forcina', login: 'Carlos.Forcina', password: '123456', role: 'Gerente', area: 'Todas', permissionLevel: 'Master' },
+  { id: '4', name: 'Julio Santos', login: 'Julio.Santos', password: '123456', role: 'Encarregado', area: 'Todas', permissionLevel: 'Master' },
+  { id: '5', name: 'Jonathan Pereira', login: 'Jonathan.Pereira', password: '123456', role: 'ADM', area: 'Todas', permissionLevel: 'Master' },
   { id: '6', name: 'Polyana Mota', login: 'Polyana.Mota', password: '123456', role: 'Analista Logístico', area: 'DDGS', permissionLevel: 'Intermediário' },
   { id: '7', name: 'Jacqueline Marques', login: 'Jacqueline.Marques', password: '123456', role: 'Analista Logístico', area: 'DDGS', permissionLevel: 'Intermediário' },
   { id: '8', name: 'Emanuela Veras', login: 'Emanuela.Veras', password: '123456', role: 'Analista Logístico', area: 'DDGS', permissionLevel: 'Intermediário' },
@@ -283,6 +298,7 @@ interface AuditLog {
   type: string;
   oldValue: string;
   newValue: string;
+  description?: string;
   changedById: string;
   changedByName: string;
   timestamp: number;
@@ -320,6 +336,9 @@ export default function App() {
   const [user, setUser] = useState<UserData | null>(null);
   const [activeTab, setActiveTab] = useState(() => localStorage.getItem('logistica_active_tab') || 'dashboard');
   const [records, setRecords] = useState<ShiftRecord[]>([]);
+  const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [confirmDeleteComment, setConfirmDeleteComment] = useState<{ recordId: string, commentId: string } | null>(null);
 
   const [selectedArea, setSelectedArea] = useState<string | null>(() => localStorage.getItem('logistica_selected_area'));
   const [selectedRegionals, setSelectedRegionals] = useState<string[]>(() => {
@@ -365,19 +384,64 @@ export default function App() {
   });
   const [appliedFilter, setAppliedFilter] = useState<'today' | '7days' | '30days' | 'custom'>('7days');
 
-  const [areaKpis, setAreaKpis] = useState<Record<string, Record<string, number>>>({
-    'Óleo': { 'Em Rota': 12, 'Toco': 8, 'Manutenção': 3, 'Sem Sinal': 2 },
-    'Etanol': { 'Em Rota': 15, 'Toco': 6, 'Manutenção': 2, 'Sem Sinal': 1 },
-    'DDGS': { 'Em Rota': 22, 'Toco': 10, 'Manutenção': 4, 'Sem Sinal': 5 },
-    'Biomassa': { 'Em Rota': 8, 'Toco': 4, 'Manutenção': 1, 'Sem Sinal': 0 },
-    'Linha Amarela': { 'Em Rota': 30, 'Toco': 15, 'Manutenção': 8, 'Sem Sinal': 3 }
-  });
+  const [operationalKpis, setOperationalKpis] = useState<Record<string, Record<string, number>>>({});
+  const [isSyncingKpi, setIsSyncingKpi] = useState(false);
+
+  // --- KPI Update Helper ---
+  const handleUpdateOperationalKpi = async (area: string, regional: string, ts: string, label: string, newValue: number) => {
+    if (!user) return;
+    
+    const kpiId = `${area}_${regional}_${ts}`.replace(/\s+/g, '_');
+    const docRef = doc(db, 'operationalKpis', kpiId);
+    
+    const currentValues = operationalKpis[kpiId] || { 'Em Rota': 0, 'Toco': 0, 'Manutenção': 0, 'Sem Sinal': 0 };
+    const oldValue = currentValues[label] || 0;
+    
+    if (oldValue === newValue) return;
+
+    // Optimistic Update
+    const newValues = { ...currentValues, [label]: newValue };
+    setOperationalKpis(prev => ({ ...prev, [kpiId]: newValues }));
+    setIsSyncingKpi(true);
+    
+    try {
+      await setDoc(docRef, {
+        id: kpiId,
+        area,
+        regional,
+        tsId: ts,
+        values: newValues,
+        updatedAt: Date.now(),
+        updatedBy: user.name
+      });
+
+      // Audit Log
+      await createAuditLog({
+        targetUserId: 'SYSTEM',
+        targetUserName: `Quadro Operacional: ${area}`,
+        type: 'KPI_UPDATE',
+        oldValue: `${label}: ${oldValue}`,
+        newValue: `${label}: ${newValue}`,
+        description: `Alteração no quadro operacional - Regional: ${regional} | TS: ${ts} | Campo: ${label}`,
+        changedById: user.id,
+        changedByName: user.name
+      });
+      
+      showToast('Alteração salva com sucesso!', 'success');
+    } catch (error) {
+      // Revert optimistic update on error
+      setOperationalKpis(prev => ({ ...prev, [kpiId]: currentValues }));
+      handleFirestoreError(error, OperationType.UPDATE, `operationalKpis/${kpiId}`);
+    } finally {
+      setIsSyncingKpi(false);
+    }
+  };
 
   // --- Firebase Sync Logic ---
   useEffect(() => {
     let unsubscribeUsers: (() => void) | null = null;
     let unsubscribeRecords: (() => void) | null = null;
-    let unsubscribeKpis: (() => void) | null = null;
+    let unsubscribeOperationalKpis: (() => void) | null = null;
 
     const setupSync = () => {
       // Listen to users
@@ -405,12 +469,41 @@ export default function App() {
         handleFirestoreError(error, OperationType.GET, 'occurrences');
       });
 
-      // Listen to KPIs
-      unsubscribeKpis = onSnapshot(doc(db, 'systemData', 'kpis'), (snap) => {
-        if (snap.exists()) {
-          setAreaKpis(snap.data() as Record<string, Record<string, number>>);
+      // Listen to Operational KPIs (Granular)
+      const qKpis = query(collection(db, 'operationalKpis'));
+      unsubscribeOperationalKpis = onSnapshot(qKpis, (snapshot) => {
+        const kpis: Record<string, Record<string, number>> = {};
+        snapshot.docs.forEach(doc => {
+          const data = doc.data();
+          kpis[doc.id] = data.values;
+        });
+        setOperationalKpis(kpis);
+
+        // Seed initial KPIs if empty
+        if (snapshot.docs.length === 0) {
+          const initialKpis: Record<string, Record<string, number>> = {
+            'Óleo': { 'Em Rota': 12, 'Toco': 8, 'Manutenção': 3, 'Sem Sinal': 2 },
+            'Etanol': { 'Em Rota': 15, 'Toco': 6, 'Manutenção': 2, 'Sem Sinal': 1 },
+            'DDGS': { 'Em Rota': 22, 'Toco': 10, 'Manutenção': 4, 'Sem Sinal': 5 },
+            'Biomassa': { 'Em Rota': 8, 'Toco': 4, 'Manutenção': 1, 'Sem Sinal': 0 },
+            'Linha Amarela': { 'Em Rota': 30, 'Toco': 15, 'Manutenção': 8, 'Sem Sinal': 3 }
+          };
+
+          Object.entries(initialKpis).forEach(([area, values]) => {
+            // Seed for MT and T1 as a starting point
+            const kpiId = `${area}_MT_T1`.replace(/\s+/g, '_');
+            setDoc(doc(db, 'operationalKpis', kpiId), {
+              id: kpiId,
+              area,
+              regional: 'MT',
+              tsId: 'T1',
+              values,
+              updatedAt: Date.now(),
+              updatedBy: 'Sistema'
+            });
+          });
         }
-      }, (err) => handleFirestoreError(err, OperationType.GET, 'systemData/kpis'));
+      }, (err) => handleFirestoreError(err, OperationType.GET, 'operationalKpis'));
     };
 
     // Start sync immediately regardless of Firebase Auth state
@@ -441,20 +534,37 @@ export default function App() {
     }
 
     testConnection();
-
-    return () => {
-      unsubscribeAuth();
+ 
+     return () => {
+       unsubscribeAuth();
       if (unsubscribeUsers) unsubscribeUsers();
       if (unsubscribeRecords) unsubscribeRecords();
-      if (unsubscribeKpis) unsubscribeKpis();
+      if (unsubscribeOperationalKpis) unsubscribeOperationalKpis();
     };
   }, []);
 
+  // Separate useEffect for notifications to handle login state changes
   useEffect(() => {
-    if (areaKpis) {
-      setDoc(doc(db, 'systemData', 'kpis'), areaKpis);
+    if (!user) {
+      setNotifications([]);
+      return;
     }
-  }, [areaKpis]);
+
+    console.log('Setting up notifications listener for user:', user.login);
+    const qNotifs = query(collection(db, 'notifications'), orderBy('timestamp', 'desc'));
+    const unsubscribe = onSnapshot(qNotifs, (snapshot) => {
+      const allNotifs = snapshot.docs.map(doc => doc.data() as AppNotification);
+      const myNotifs = allNotifs.filter(n => n.recipientId === user.id);
+      console.log(`Received ${allNotifs.length} total notifications, ${myNotifs.length} for user`);
+      setNotifications(myNotifs);
+    }, (err) => {
+      console.error('Notification listener error:', err);
+      handleFirestoreError(err, OperationType.GET, 'notifications');
+    });
+
+    return () => unsubscribe();
+  }, [user?.id]);
+
 
   // --- Data Consistency & Remanagement Migration ---
   useEffect(() => {
@@ -597,17 +707,29 @@ export default function App() {
       const oldUser = usersList.find(u => u.id === updatedUser.id);
       await setDoc(doc(db, 'users', updatedUser.id), updatedUser);
       
-      // Log Audit
+      // Log Audit with detailed changes
       if (oldUser) {
-        await createAuditLog({
-          targetUserId: updatedUser.id,
-          targetUserName: updatedUser.name,
-          type: 'UPDATE_DATA',
-          oldValue: JSON.stringify(oldUser),
-          newValue: JSON.stringify(updatedUser),
-          changedById: user!.id,
-          changedByName: user!.name
+        const changes: string[] = [];
+        const fieldsToCompare: (keyof UserData)[] = ['name', 'login', 'role', 'area', 'permissionLevel'];
+        
+        fieldsToCompare.forEach(field => {
+          if (oldUser[field] !== updatedUser[field]) {
+            changes.push(`${field}: "${oldUser[field]}" -> "${updatedUser[field]}"`);
+          }
         });
+
+        if (changes.length > 0) {
+          await createAuditLog({
+            targetUserId: updatedUser.id,
+            targetUserName: updatedUser.name,
+            type: 'UPDATE_DATA',
+            oldValue: JSON.stringify(oldUser),
+            newValue: JSON.stringify(updatedUser),
+            description: `Campos alterados: ${changes.join(' | ')}`,
+            changedById: user!.id,
+            changedByName: user!.name
+          });
+        }
       }
 
       if (user?.id === updatedUser.id) {
@@ -749,45 +871,63 @@ export default function App() {
   }, [selectedShiftId]);
 
   const handleSaveShiftRecord = async (shiftId: string) => {
-    const input = shiftInputs[shiftId];
-    if (!selectedFormUnit && !isUnitHidden) {
-       showToast('Por favor, selecione uma unidade.', 'error');
-       return;
-     }
-    if (!input.description.replace(/<[^>]*>/g, '').trim()) {
-      showToast('Por favor, descreva o relato operacional.', 'error');
-      return;
-    }
-
-    const id = `LOG-${Date.now().toString(36).toUpperCase()}`;
-    
-    // Determine the regional based on the selected unit
-    let unitRegional = selectedRegionals[0];
-    for (const [reg, units] of Object.entries(REGIONAL_UNITS_MAP)) {
-      if (units.includes(selectedFormUnit)) {
-        unitRegional = reg;
-        break;
-      }
-    }
-
-    const newRecord: ShiftRecord = {
-      id,
-      date: format(new Date(), 'yyyy-MM-dd'),
-      userId: user!.id,
-      userName: user!.name,
-      area: selectedArea!,
-      regional: unitRegional,
-      tsId: shiftId,
-      unidade: selectedFormUnit,
-      shift: LOGISTICS_SHIFTS.find(s => s.id === shiftId)?.name || 'N/A',
-      status: input.status,
-      executionStatus: 'Em andamento',
-      description: input.description,
-      timestamp: Date.now()
-    };
-
     try {
-      await setDoc(doc(db, 'occurrences', id), newRecord);
+      const input = shiftInputs[shiftId];
+      
+      // Validation: Only require unit if there are units available for selection
+      const hasAvailableUnits = filteredUnits.length > 0;
+      
+      if (hasAvailableUnits && !selectedFormUnit && !isUnitHidden) {
+         showToast('Por favor, selecione uma unidade.', 'error');
+         return;
+       }
+
+      if (!input.description.replace(/<[^>]*>/g, '').trim()) {
+        showToast('Por favor, descreva o relato operacional.', 'error');
+        return;
+      }
+
+      if (!user) {
+        showToast('Sessão expirada. Por favor, faça login novamente.', 'error');
+        return;
+      }
+
+      if (!selectedArea) {
+        showToast('Por favor, selecione uma área antes de salvar.', 'error');
+        return;
+      }
+
+      // Determine the regional based on the selected unit
+      let unitRegional = selectedRegionals.length > 0 ? selectedRegionals[0] : '';
+      if (selectedFormUnit) {
+        for (const [reg, units] of Object.entries(REGIONAL_UNITS_MAP)) {
+          if (units.includes(selectedFormUnit)) {
+            unitRegional = reg;
+            break;
+          }
+        }
+      }
+
+      const docRef = doc(collection(db, 'occurrences'));
+      const id = docRef.id;
+      
+      const newRecord: ShiftRecord = {
+        id,
+        date: format(new Date(), 'yyyy-MM-dd'),
+        userId: user.id,
+        userName: user.name,
+        area: selectedArea,
+        regional: unitRegional || '',
+        tsId: shiftId,
+        unidade: selectedFormUnit || '',
+        shift: LOGISTICS_SHIFTS.find(s => s.id === shiftId)?.name || 'N/A',
+        status: input.status,
+        executionStatus: 'Em andamento',
+        description: input.description,
+        timestamp: Date.now()
+      };
+
+      await setDoc(docRef, newRecord);
       
       setLastSavedId(newRecord.id);
       setAppliedFilter('7days');
@@ -802,7 +942,7 @@ export default function App() {
         [shiftId]: { status: 'normal', description: '' }
       }));
       setSelectedFormUnit('');
-      showToast('Ocorrência registrada com sucesso!');
+      showToast('Ocorrência registrada com sucesso!', 'success');
       
       setTimeout(() => {
         const historyElement = document.getElementById('history-list-container');
@@ -814,7 +954,13 @@ export default function App() {
         setTimeout(() => setLastSavedId(null), 8000);
       }, 100);
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'occurrences');
+      console.error('Error saving shift record:', err);
+      try {
+        handleFirestoreError(err, OperationType.WRITE, 'occurrences');
+      } catch (richError) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        showToast(`Erro ao salvar: ${errorMessage.substring(0, 50)}...`, 'error');
+      }
     }
   };
 
@@ -834,8 +980,9 @@ export default function App() {
     const text = commentInputs[recordId];
     if (!text?.trim() || !user) return;
 
+    const commentId = Date.now().toString(36);
     const newComment: RecordComment = {
-      id: Date.now().toString(36),
+      id: commentId,
       userId: user.id,
       userName: user.name,
       text: text.trim(),
@@ -849,10 +996,122 @@ export default function App() {
       await updateDoc(doc(db, 'occurrences', recordId), {
         comments: [...(record.comments || []), newComment]
       });
+
+      // Mention Logic
+      const mentionRegex = /@([a-zA-Z0-9._\-\u00C0-\u00FF]+)/g;
+      const mentions = [...text.matchAll(mentionRegex)];
+      
+      const uniqueLogins = [...new Set(mentions.map(m => m[1].toLowerCase()))];
+      
+      for (const login of uniqueLogins) {
+        const mentionedUser = usersList.find(u => u.login.toLowerCase() === login);
+        
+        if (mentionedUser) {
+          const notifId = `NOTIF-${Date.now()}-${mentionedUser.id}-${Math.random().toString(36).slice(2, 7)}`;
+          await setDoc(doc(db, 'notifications', notifId), {
+            id: notifId,
+            recipientId: mentionedUser.id,
+            recipientLogin: mentionedUser.login,
+            senderId: user.id,
+            senderName: user.name,
+            commentId,
+            recordId,
+            text: text.trim().substring(0, 50) + (text.length > 50 ? '...' : ''),
+            isRead: false,
+            timestamp: Date.now()
+          } as AppNotification);
+        }
+      }
+
       setCommentInputs({ ...commentInputs, [recordId]: '' });
       showToast('Comentário adicionado!');
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `occurrences/${recordId}`);
+    }
+  };
+
+  const handleDeleteComment = async (recordId: string, commentId: string) => {
+    console.log(`Starting deletion of comment ${commentId} in record ${recordId}`);
+    try {
+      const record = records.find(r => r.id === recordId);
+      if (!record || !user) return;
+
+      const comment = record.comments?.find(c => c.id === commentId);
+      if (!comment) return;
+
+      // Permissions check
+      const isOwner = comment.userId === user.id;
+      const isMasterUser = user.permissionLevel === 'Master';
+      
+      if (!isMasterUser && !isOwner) {
+        showToast('Sem permissão para excluir este comentário.', 'error');
+        return;
+      }
+
+      const updatedComments = (record.comments || []).filter(c => c.id !== commentId);
+      
+      // Update occurrence
+      await updateDoc(doc(db, 'occurrences', recordId), {
+        comments: updatedComments
+      });
+
+      setConfirmDeleteComment(null);
+      showToast('Comentário removido!', 'success');
+
+      // Background tasks
+      (async () => {
+        try {
+          const qNotifs = query(collection(db, 'notifications'), where('commentId', '==', commentId));
+          const notifsSnap = await getDocs(qNotifs);
+          await Promise.all(notifsSnap.docs.map(doc => deleteDoc(doc.ref)));
+          
+          await createAuditLog({
+            targetUserId: recordId,
+            targetUserName: `Comentário em ${recordId}`,
+            type: 'DELETE_COMMENT',
+            oldValue: comment.text,
+            newValue: 'EXCLUÍDO',
+            description: `Comentário de ${comment.userName} removido por ${user.name}`,
+            changedById: user.id,
+            changedByName: user.name
+          });
+        } catch (error) {
+          console.error('Audit/Notification background tasks failed:', error);
+        }
+      })();
+
+    } catch (err) {
+      console.error('Delete Comment Error:', err);
+      handleFirestoreError(err, OperationType.UPDATE, `occurrences/${recordId}`);
+    }
+  };
+
+  const handleMarkNotificationRead = async (notif: AppNotification) => {
+    try {
+      await updateDoc(doc(db, 'notifications', notif.id), { isRead: true });
+      setShowNotifications(false);
+      
+      const record = records.find(r => r.id === notif.recordId);
+      if (record) {
+        setSelectedArea(record.area);
+        setSelectedRegionals([record.regional]);
+        setSelectedShiftId(record.tsId);
+        setActiveCommentId(record.id);
+
+        // Scroll to record after state updates
+        setTimeout(() => {
+          const element = document.getElementById(`record-${notif.recordId}`);
+          if (element) {
+            element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            element.classList.add('ring-2', 'ring-[#EBA83A]', 'ring-offset-2');
+            setTimeout(() => {
+              element.classList.remove('ring-2', 'ring-[#EBA83A]', 'ring-offset-2');
+            }, 3000);
+          }
+        }, 300);
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `notifications/${notif.id}`);
     }
   };
 
@@ -972,6 +1231,80 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-3">
+          <div className="relative">
+            <button 
+              onClick={() => setShowNotifications(!showNotifications)}
+              className={`p-2 rounded-lg border transition-all relative ${
+                showNotifications ? 'bg-white/20 border-white/40' : 'bg-white/10 border-white/20 hover:bg-white/20'
+              }`}
+            >
+              <Bell className="w-4 h-4" />
+              {notifications.filter(n => !n.isRead).length > 0 && (
+                <span className="absolute -top-1 -right-1 w-4 h-4 bg-red-500 text-white text-[9px] font-black rounded-full flex items-center justify-center border-2 border-[#2B4C7E]">
+                  {notifications.filter(n => !n.isRead).length}
+                </span>
+              )}
+            </button>
+
+            <AnimatePresence>
+              {showNotifications && (
+                <>
+                  <div className="fixed inset-0 z-[60]" onClick={() => setShowNotifications(false)} />
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                    className="absolute top-[calc(100%+8px)] right-0 w-80 bg-white text-[#2B4C7E] rounded-2xl shadow-2xl border border-slate-100 z-[70] overflow-hidden"
+                  >
+                    <div className="p-4 bg-slate-50 border-b border-slate-100 flex items-center justify-between">
+                      <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Notificações</span>
+                      {notifications.some(n => !n.isRead) && (
+                        <button 
+                          onClick={async () => {
+                            for (const n of notifications.filter(notif => !notif.isRead)) {
+                              await updateDoc(doc(db, 'notifications', n.id), { isRead: true });
+                            }
+                          }}
+                          className="text-[9px] font-black uppercase text-[#2B4C7E] hover:underline"
+                        >
+                          Limpar Tudo
+                        </button>
+                      )}
+                    </div>
+                    <div className="max-h-96 overflow-y-auto no-scrollbar">
+                      {notifications.length === 0 ? (
+                        <div className="p-8 text-center">
+                          <Bell className="w-10 h-10 text-slate-100 mx-auto mb-2" />
+                          <p className="text-[10px] font-bold text-slate-300 uppercase italic">Nenhuma notificação</p>
+                        </div>
+                      ) : (
+                        notifications.map(n => (
+                          <button
+                            key={n.id}
+                            onClick={() => handleMarkNotificationRead(n)}
+                            className={`w-full text-left p-4 border-b border-slate-50 hover:bg-slate-50 transition-colors flex gap-3 relative ${!n.isRead ? 'bg-blue-50/30' : ''}`}
+                          >
+                            {!n.isRead && <div className="absolute top-4 right-4 w-2 h-2 bg-blue-500 rounded-full" />}
+                            <div className="w-8 h-8 rounded-full bg-[#2B4C7E]/10 flex items-center justify-center shrink-0">
+                              <User className="w-4 h-4 text-[#2B4C7E]" />
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-[11px] font-black leading-tight mb-0.5">
+                                <span className="text-[#EBA83A]">{n.senderName}</span> mencionou você
+                              </p>
+                              <p className="text-[10px] text-slate-500 truncate mb-1 italic">"{n.text}"</p>
+                              <p className="text-[9px] font-bold text-slate-300 uppercase tracking-widest">{format(n.timestamp, 'dd/MM/yy HH:mm')}</p>
+                            </div>
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  </motion.div>
+                </>
+              )}
+            </AnimatePresence>
+          </div>
+
           {(user.role === 'Gerente' || user.role === 'ADM') && (
             <button 
               onClick={() => setActiveTab(activeTab === 'users' ? 'dashboard' : 'users')}
@@ -1266,9 +1599,21 @@ export default function App() {
                        {selectedShiftId}
                      </div>
                      <div>
-                        <h2 className="text-lg font-black text-[#2B4C7E] uppercase tracking-tighter italic leading-tight">
-                          {selectedArea} • {selectedRegionals.length > 1 ? 'Análise Consolidada' : (selectedRegional || 'Múltiplas')} • {LOGISTICS_SHIFTS.find(s => s.id === selectedShiftId)?.name}
-                        </h2>
+                        <div className="flex items-center gap-2">
+                          <h2 className="text-lg font-black text-[#2B4C7E] uppercase tracking-tighter italic leading-tight">
+                            {selectedArea} • {selectedRegionals.length > 1 ? 'Análise Consolidada' : (selectedRegional || 'Múltiplas')} • {LOGISTICS_SHIFTS.find(s => s.id === selectedShiftId)?.name}
+                          </h2>
+                          {isSyncingKpi && (
+                            <motion.div
+                              initial={{ opacity: 0, x: -10 }}
+                              animate={{ opacity: 1, x: 0 }}
+                              className="flex items-center gap-1.5 px-2 py-0.5 bg-emerald-50 rounded-full border border-emerald-100"
+                            >
+                              <RefreshCw className="w-2.5 h-2.5 text-emerald-500 animate-spin" />
+                              <span className="text-[8px] font-black uppercase text-emerald-600">Sincronizando</span>
+                            </motion.div>
+                          )}
+                        </div>
                        <p className="text-[10px] font-black uppercase tracking-widest text-[#EBA83A]">Monitoramento em Tempo Real</p>
                      </div>
                    </div>
@@ -1277,7 +1622,17 @@ export default function App() {
 
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                   {['Em Rota', 'Toco', 'Manutenção', 'Sem Sinal'].map((label, idx) => {
-                    const count = areaKpis[selectedArea]?.[label] || 0;
+                    let count = 0;
+                    if (selectedRegional) {
+                      const kpiId = `${selectedArea}_${selectedRegional}_${selectedShiftId}`.replace(/\s+/g, '_');
+                      count = operationalKpis[kpiId]?.[label] || 0;
+                    } else {
+                      selectedRegionals.forEach(reg => {
+                        const kpiId = `${selectedArea}_${reg}_${selectedShiftId}`.replace(/\s+/g, '_');
+                        count += (operationalKpis[kpiId]?.[label] || 0);
+                      });
+                    }
+
                     const Icon = [Truck, Building2, Wrench, WifiOff][idx];
                     const styles = {
                       'Em Rota': { bg: 'bg-emerald-50', text: 'text-emerald-700', border: 'border-emerald-500', icon: 'text-emerald-500' },
@@ -1286,30 +1641,58 @@ export default function App() {
                       'Sem Sinal': { bg: 'bg-slate-100', text: 'text-slate-700', border: 'border-slate-400', icon: 'text-slate-500' }
                     }[label] || { bg: 'bg-slate-50', text: 'text-slate-700', border: 'border-slate-400', icon: 'text-slate-400' };
 
+                    const canEdit = !!selectedRegional;
+
                     return (
                       <Card 
                         key={label} 
-                        className={`border-none shadow-sm ${styles.bg} border-b-4 ${styles.border} transition-all hover:shadow-md cursor-pointer group`} 
-                        onClick={() => setEditingKpi(label)}
+                        className={`border-none shadow-sm ${styles.bg} border-b-4 ${styles.border} transition-all hover:shadow-md ${canEdit ? 'cursor-pointer group' : ''} relative overflow-hidden`} 
+                        onClick={() => {
+                          if (canEdit) {
+                            setEditingKpi(label);
+                          } else {
+                            showToast('Selecione uma única Regional para editar os números.', 'error');
+                          }
+                        }}
                       >
                         <CardContent className="p-4">
                           <div className="flex items-center justify-between mb-2">
-                             <Icon className={`w-4 h-4 ${styles.icon}`} />
+                             <div className="flex items-center gap-2">
+                               <Icon className={`w-4 h-4 ${styles.icon}`} />
+                               {isSyncingKpi && editingKpi === label && (
+                                 <motion.div
+                                   animate={{ rotate: 360 }}
+                                   transition={{ repeat: Infinity, duration: 1, ease: 'linear' }}
+                                 >
+                                   <RefreshCw className="w-2.5 h-2.5 text-slate-400" />
+                                 </motion.div>
+                               )}
+                             </div>
                              <span className="text-[8px] font-black uppercase tracking-[.2em] text-slate-400">Total</span>
                           </div>
                           <div>
-                            {editingKpi === label ? (
+                            {editingKpi === label && canEdit ? (
                               <input
                                 autoFocus
                                 type="number"
                                 defaultValue={count}
-                                onBlur={(e) => {
+                                onBlur={async (e) => {
                                   const val = parseInt(e.target.value) || 0;
-                                  setAreaKpis(prev => ({
-                                    ...prev,
-                                    [selectedArea]: { ...prev[selectedArea], [label]: val }
-                                  }));
+                                  if (selectedArea && selectedRegional && selectedShiftId) {
+                                    await handleUpdateOperationalKpi(selectedArea, selectedRegional, selectedShiftId, label, val);
+                                  }
                                   setEditingKpi(null);
+                                }}
+                                onKeyDown={async (e) => {
+                                  if (e.key === 'Enter') {
+                                    const val = parseInt((e.target as HTMLInputElement).value) || 0;
+                                    if (selectedArea && selectedRegional && selectedShiftId) {
+                                      await handleUpdateOperationalKpi(selectedArea, selectedRegional, selectedShiftId, label, val);
+                                    }
+                                    setEditingKpi(null);
+                                  } else if (e.key === 'Escape') {
+                                    setEditingKpi(null);
+                                  }
                                 }}
                                 className={`text-2xl font-black font-mono w-full bg-white/50 border-none p-0 outline-none ${styles.text}`}
                               />
@@ -1318,6 +1701,11 @@ export default function App() {
                             )}
                             <p className="text-[10px] font-black uppercase tracking-widest text-[#2B4C7E] truncate mt-1">{label}</p>
                           </div>
+                          {!canEdit && (
+                            <div className="absolute top-1 right-1 opacity-20">
+                              <Lock className="w-3 h-3" />
+                            </div>
+                          )}
                         </CardContent>
                       </Card>
                     )
@@ -1548,7 +1936,7 @@ export default function App() {
                   ) : (
                     <div className="flex flex-col gap-4">
                       {filteredRecords.map((r) => (
-                        <Card key={r.id} className={`border-none shadow-sm overflow-hidden border-l-4 ${
+                        <Card key={r.id} id={`record-${r.id}`} className={`border-none shadow-sm overflow-hidden border-l-4 ${
                           r.status === 'critical' ? 'border-l-red-500 shadow-red-50/20' : 
                           r.status === 'alert' ? 'border-l-orange-500 shadow-orange-50/20' : 
                           'border-l-green-500 shadow-green-50/20'
@@ -1660,12 +2048,43 @@ export default function App() {
                                     <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="overflow-hidden">
                                       <div className="space-y-3 pt-4 pl-4 border-l-2 border-slate-100 mt-2">
                                         {r.comments?.map(c => (
-                                          <div key={c.id} className="bg-slate-50 p-3 rounded-lg relative">
-                                            <div className="flex justify-between items-center mb-1">
-                                              <span className="text-[10px] font-bold text-[#2B4C7E] uppercase">{c.userName}</span>
-                                              <span className="text-[9px] text-slate-400">{format(new Date(c.timestamp), 'dd/MM HH:mm')}</span>
+                                          <div key={c.id} className="bg-slate-50 p-3 rounded-lg relative group/comment border border-slate-100">
+                                            <div className="flex justify-between items-start mb-1">
+                                              <div className="flex flex-col">
+                                                <span className="text-[10px] font-bold text-[#2B4C7E] uppercase">{c.userName}</span>
+                                                <span className="text-[8px] text-slate-400 font-medium">{format(new Date(c.timestamp), 'dd/MM HH:mm')}</span>
+                                              </div>
+                                              {(user?.permissionLevel === 'Master' || c.userId === user?.id) && (
+                                                <div className="flex items-center gap-1 shrink-0">
+                                                  {confirmDeleteComment?.commentId === c.id ? (
+                                                    <div className="flex items-center gap-2 bg-red-50 px-3 py-1.5 rounded-lg border border-red-200 shadow-sm animate-in fade-in zoom-in duration-200">
+                                                      <button 
+                                                        onClick={() => handleDeleteComment(r.id, c.id)}
+                                                        className="text-[10px] font-black text-red-600 hover:text-red-700 uppercase tracking-tight flex items-center gap-1"
+                                                      >
+                                                        <Check className="w-3 h-3" /> Excluir
+                                                      </button>
+                                                      <div className="w-[1px] h-3 bg-red-200" />
+                                                      <button 
+                                                        onClick={() => setConfirmDeleteComment(null)}
+                                                        className="text-[10px] font-bold text-slate-400 hover:text-slate-600 uppercase tracking-tight"
+                                                      >
+                                                        Sair
+                                                      </button>
+                                                    </div>
+                                                  ) : (
+                                                    <button 
+                                                      onClick={() => setConfirmDeleteComment({ recordId: r.id, commentId: c.id })}
+                                                      className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-md transition-all shrink-0 opacity-0 group-hover/comment:opacity-100"
+                                                      title="Excluir este comentário"
+                                                    >
+                                                      <Trash2 className="w-4 h-4" />
+                                                    </button>
+                                                  )}
+                                                </div>
+                                              )}
                                             </div>
-                                            <p className="text-xs text-slate-600">{c.text}</p>
+                                            <p className="text-xs text-slate-600 leading-relaxed">{c.text}</p>
                                           </div>
                                         ))}
                                         <div className="flex gap-2">
@@ -1730,7 +2149,7 @@ export default function App() {
                       value={userSearchQuery}
                       onChange={(e) => setUserSearchQuery(e.target.value)}
                       placeholder="Buscar usuário..."
-                      className="h-9 w-64 pl-9 text-[10px] font-bold uppercase border-slate-200 focus:border-[#2B4C7E] rounded-lg"
+                      className="h-9 w-64 pl-9 text-[10px] font-bold border-slate-200 focus:border-[#2B4C7E] rounded-lg"
                     />
                   </div>
                   {user.permissionLevel === 'Master' && (
@@ -1773,8 +2192,8 @@ export default function App() {
                                 <User className="w-5 h-5" />
                               </div>
                               <div>
-                                <p className="text-xs font-bold text-[#2B4C7E] uppercase">{u.name}</p>
-                                <p className="text-[9px] font-medium text-slate-400 uppercase tracking-widest">Cadastrado em {format(new Date(), 'dd/MM/yy')}</p>
+                                <p className="text-xs font-bold text-[#2B4C7E]">{u.name}</p>
+                                <p className="text-[9px] font-medium text-slate-400 uppercase tracking-widest">{u.role} | Cadastrado em {format(new Date(), 'dd/MM/yy')}</p>
                               </div>
                             </div>
                           </td>
@@ -1853,7 +2272,7 @@ export default function App() {
                           placeholder="Nome Completo"
                           value={newUserForm.name}
                           onChange={(e) => setNewUserForm({...newUserForm, name: e.target.value})}
-                          className="h-12 text-xs font-bold uppercase border-2 border-slate-100 focus:border-[#2B4C7E] rounded-xl"
+                          className="h-12 text-xs font-bold border-2 border-slate-100 focus:border-[#2B4C7E] rounded-xl"
                         />
                       </div>
                       
@@ -1862,9 +2281,21 @@ export default function App() {
                         <Input 
                           placeholder="Ex: joao.silva"
                           value={newUserForm.login}
-                          onChange={(e) => setNewUserForm({...newUserForm, login: e.target.value.toLowerCase().trim()})}
+                          onChange={(e) => setNewUserForm({...newUserForm, login: e.target.value.trim()})}
                           className="h-12 text-xs font-mono font-bold border-2 border-slate-100 focus:border-[#2B4C7E] rounded-xl"
                         />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-black uppercase text-slate-400 pl-1">Cargo / Função</label>
+                        <select 
+                          className="w-full h-12 bg-white border-2 border-slate-100 focus:border-[#2B4C7E] rounded-xl px-4 text-xs font-bold appearance-none outline-none"
+                          value={newUserForm.role}
+                          onChange={(e) => setNewUserForm({...newUserForm, role: e.target.value as UserRole})}
+                        >
+                          <option value="">Selecione o Cargo</option>
+                          {CARGOS.map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
                       </div>
 
                       <div className="space-y-1.5">
@@ -1912,7 +2343,7 @@ export default function App() {
                       <div className="flex gap-3 pt-4">
                         <Button 
                           onClick={async () => {
-                            if (!newUserForm.name || !newUserForm.login || !newUserForm.password || !newUserForm.area) {
+                            if (!newUserForm.name || !newUserForm.login || !newUserForm.password || !newUserForm.area || !newUserForm.role) {
                               showToast('Todos os campos são obrigatórios!', 'error');
                               return;
                             }
@@ -1978,16 +2409,26 @@ export default function App() {
                         <Input 
                           value={editingUser.name}
                           onChange={(e) => setEditingUser({...editingUser, name: e.target.value})}
-                          className="h-12 text-xs font-bold uppercase border-2 border-slate-100 focus:border-[#2B4C7E] rounded-xl"
+                          className="h-12 text-xs font-bold border-2 border-slate-100 focus:border-[#2B4C7E] rounded-xl"
                         />
                       </div>
                       <div className="space-y-1.5">
                         <label className="text-[10px] font-black uppercase text-slate-400 pl-1">Login / Usuário</label>
                         <Input 
                           value={editingUser.login}
-                          onChange={(e) => setEditingUser({...editingUser, login: e.target.value.toLowerCase().trim()})}
+                          onChange={(e) => setEditingUser({...editingUser, login: e.target.value.trim()})}
                           className="h-12 text-xs font-mono font-bold border-2 border-slate-100 focus:border-[#2B4C7E] rounded-xl"
                         />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-black uppercase text-slate-400 pl-1">Cargo / Função</label>
+                        <select 
+                          className="w-full h-12 bg-white border-2 border-slate-100 focus:border-[#2B4C7E] rounded-xl px-4 text-xs font-bold appearance-none outline-none"
+                          value={editingUser.role}
+                          onChange={(e) => setEditingUser({...editingUser, role: e.target.value as UserRole})}
+                        >
+                          {CARGOS.map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
                       </div>
                       <div className="space-y-1.5">
                         <label className="text-[10px] font-black uppercase text-slate-400 pl-1">Área Atuação</label>
